@@ -1,113 +1,39 @@
-import { createUIMessageStream, JsonToSseTransformStream } from "ai";
-import { differenceInSeconds } from "date-fns";
-import { auth } from "@/app/(auth)/auth";
-import {
-  getChatById,
-  getMessagesByChatId,
-  getStreamIdsByChatId,
-} from "@/lib/db/queries";
-import type { Chat } from "@/lib/db/schema";
-import { ChatSDKError } from "@/lib/errors";
-import type { ChatMessage } from "@/lib/types";
-import { getStreamContext } from "../../route";
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+import { streamText, convertToModelMessages } from 'ai';
 
-export async function GET(
-  _: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  const { id: chatId } = await params;
+// 1. Setup OpenRouter Provider
+// This uses the key you saved in Vercel Settings
+const openrouter = createOpenRouter({
+  apiKey: process.env.OPENROUTER_API_KEY,
+});
 
-  const streamContext = getStreamContext();
-  const resumeRequestedAt = new Date();
+// Allow streaming responses up to 30 seconds
+export const maxDuration = 30;
 
-  if (!streamContext) {
-    return new Response(null, { status: 204 });
-  }
-
-  if (!chatId) {
-    return new ChatSDKError("bad_request:api").toResponse();
-  }
-
-  const session = await auth();
-
-  if (!session?.user) {
-    return new ChatSDKError("unauthorized:chat").toResponse();
-  }
-
-  let chat: Chat | null;
-
+export async function POST(req: Request) {
   try {
-    chat = await getChatById({ id: chatId });
-  } catch {
-    return new ChatSDKError("not_found:chat").toResponse();
-  }
+    const { messages } = await req.json();
 
-  if (!chat) {
-    return new ChatSDKError("not_found:chat").toResponse();
-  }
-
-  if (chat.visibility === "private" && chat.userId !== session.user.id) {
-    return new ChatSDKError("forbidden:chat").toResponse();
-  }
-
-  const streamIds = await getStreamIdsByChatId({ chatId });
-
-  if (!streamIds.length) {
-    return new ChatSDKError("not_found:stream").toResponse();
-  }
-
-  const recentStreamId = streamIds.at(-1);
-
-  if (!recentStreamId) {
-    return new ChatSDKError("not_found:stream").toResponse();
-  }
-
-  const emptyDataStream = createUIMessageStream<ChatMessage>({
-    // biome-ignore lint/suspicious/noEmptyBlockStatements: "Needs to exist"
-    execute: () => {},
-  });
-
-  const stream = await streamContext.resumableStream(recentStreamId, () =>
-    emptyDataStream.pipeThrough(new JsonToSseTransformStream())
-  );
-
-  /*
-   * For when the generation is streaming during SSR
-   * but the resumable stream has concluded at this point.
-   */
-  if (!stream) {
-    const messages = await getMessagesByChatId({ id: chatId });
-    const mostRecentMessage = messages.at(-1);
-
-    if (!mostRecentMessage) {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    if (mostRecentMessage.role !== "assistant") {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const messageCreatedAt = new Date(mostRecentMessage.createdAt);
-
-    if (differenceInSeconds(resumeRequestedAt, messageCreatedAt) > 15) {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const restoredStream = createUIMessageStream<ChatMessage>({
-      execute: ({ writer }) => {
-        writer.write({
-          type: "data-appendMessage",
-          data: JSON.stringify(mostRecentMessage),
-          transient: true,
-        });
+    // 2. The Core AI Logic
+    const result = await streamText({
+      model: openrouter('xiaomi/mimo-v2-flash:free'), 
+      messages: convertToModelMessages(messages),
+      // Optional: Add reasoning for MiMo if you want it to "think" more
+      providerOptions: {
+        openrouter: {
+          reasoning: true,
+        },
       },
     });
 
+    // 3. Send the response back to your Chat UI
+    return result.toDataStreamResponse();
+
+  } catch (error) {
+    console.error("AI Route Error:", error);
     return new Response(
-      restoredStream.pipeThrough(new JsonToSseTransformStream()),
-      { status: 200 }
+      JSON.stringify({ error: "Failed to connect to MiMo. Check your API key in Vercel." }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
     );
   }
-
-  return new Response(stream, { status: 200 });
 }
